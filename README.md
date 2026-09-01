@@ -2,13 +2,13 @@
 
 A disk usage map for macOS in one Swift file
 
-## oneline build and run (with folder picker)
-
 ```sh
 swiftc -O treemap.swift -o treemap && ./treemap
 ```
 
-## Or build and then run, optional directory to scan
+<img width="600" alt="screenshot of treemap app" src="https://github.com/user-attachments/assets/79ab99b5-8942-4456-ae18-4f15a0b07fc3" />
+
+If using regularly build and then run (optional scan directory passed via arg)
 
 ```sh
 swiftc -O main.swift -o treemap 
