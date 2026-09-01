@@ -51,29 +51,31 @@ enum Scan {
         let vol = (try? root.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier
         var seen = 0
         func walk(_ dir: Node, _ url: URL) {
-            guard let entries = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: keyList, options: []) else { return }
-            var kids: [Node] = []
-            kids.reserveCapacity(entries.count)
-            for u in entries {
-                guard let v = try? u.resourceValues(forKeys: keys) else { continue }
-                let n = Node(u.lastPathComponent, dir)
-                if v.isSymbolicLink != true, v.isDirectory == true {
-                    if let a = vol, let b = v.volumeIdentifier, !a.isEqual(b) { continue }
-                    n.children = []
-                    walk(n, u)
-                } else {
-                    n.size = Int64(v.totalFileAllocatedSize ?? v.fileSize ?? 0)
-                    n.count = 1
-                    n.tag = fnv(u.pathExtension.lowercased())
-                    seen += 1
-                    if seen & 4095 == 0 { progress(seen) }
+            autoreleasepool {                              // drain Foundation temporaries per directory
+                guard let entries = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: keyList, options: []) else { return }
+                var kids: [Node] = []
+                kids.reserveCapacity(entries.count)
+                for u in entries {
+                    guard let v = try? u.resourceValues(forKeys: keys) else { continue }
+                    let n = Node(u.lastPathComponent, dir)
+                    if v.isSymbolicLink != true, v.isDirectory == true {
+                        if let a = vol, let b = v.volumeIdentifier, !a.isEqual(b) { continue }
+                        n.children = []
+                        walk(n, u)
+                    } else {
+                        n.size = Int64(v.totalFileAllocatedSize ?? v.fileSize ?? 0)
+                        n.count = 1
+                        n.tag = fnv(u.pathExtension.lowercased())
+                        seen += 1
+                        if seen & 4095 == 0 { progress(seen) }
+                    }
+                    dir.size += n.size
+                    dir.count += n.count
+                    kids.append(n)
                 }
-                dir.size += n.size
-                dir.count += n.count
-                kids.append(n)
+                kids.sort { $0.size > $1.size }
+                dir.children = kids
             }
-            kids.sort { $0.size > $1.size }
-            dir.children = kids
         }
         walk(top, root)
         return top
