@@ -17,7 +17,7 @@
 // 
 // Build: swiftc -O main.swift -o treemap
 // Run:   ./treemap [folder]        (no arg → folder picker)
-// Hover = path/size · click = zoom into that subfolder · Esc = zoom out
+// Hover = path/size · click a folder to zoom in · Esc = zoom out
 // Click breadcrumbs = jump to that folder (rescans if above the opened folder) · ⌘-click = reveal in Finder
 // Right-click = menu (Reveal in Finder / Move to Trash / Zoom Out) · ⌘O open · ⌘R rescan · ⌘Q quit
 import AppKit
@@ -75,6 +75,7 @@ enum Scan {
                     kids.append(n)
                 }
                 kids.sort { $0.size > $1.size }
+                dir.tag = kids.first(where: { $0.size > 0 })?.tag ?? 0   // color from largest descendant type
                 dir.children = kids
             }
         }
@@ -93,8 +94,19 @@ final class TreemapView: NSView {
     private var hovered: Int?
     private var menuNode: Node?
     private var colors: [UInt32: CGColor] = [:]
+    private let bytes = ByteCountFormatter()
     private static let noExt = Scan.fnv("")
-    private static let dirColor = CGColor(gray: 0.35, alpha: 1)
+    private static let maxShare = 0.75          // largest child cannot eat the whole view
+    private static let minSide: CGFloat = 28    // clickable / labelable floor
+    private static let namePara: NSParagraphStyle = {
+        let p = NSMutableParagraphStyle(); p.alignment = .center; p.lineBreakMode = .byTruncatingMiddle; return p
+    }()
+    private static let darkHalo: NSShadow = {
+        let s = NSShadow(); s.shadowColor = NSColor.black.withAlphaComponent(0.75); s.shadowBlurRadius = 2.5; s.shadowOffset = .zero; return s
+    }()
+    private static let lightHalo: NSShadow = {
+        let s = NSShadow(); s.shadowColor = NSColor.white.withAlphaComponent(0.8); s.shadowBlurRadius = 2.5; s.shadowOffset = .zero; return s
+    }()
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -105,7 +117,7 @@ final class TreemapView: NSView {
         super.updateTrackingAreas()
     }
 
-    // Squarified treemap (Bruls et al.). Only leaves are recorded; tiny dirs become gray leaves.
+    // Squarified treemap (Bruls et al.). One level of children; folders stay folders.
     private func relayout() {
         items.removeAll(keepingCapacity: true)
         hovered = nil
@@ -115,50 +127,90 @@ final class TreemapView: NSView {
 
     private func place(_ node: Node, _ rect: CGRect) {
         if rect.width < 0.5 || rect.height < 0.5 { return }
-        guard let kids = node.children, node.size > 0, rect.width >= 3, rect.height >= 3 else { items.append((rect, node)); return }
-        let scale = Double(rect.width * rect.height) / Double(node.size)   // px² per byte
+        guard let raw = node.children, node.size > 0, rect.width >= 3, rect.height >= 3 else { items.append((rect, node)); return }
+        let kids = raw.filter { $0.size > 0 }
+        guard !kids.isEmpty else { items.append((rect, node)); return }
+        let areas = tileAreas(kids, in: rect)
         var rem = rect
-        var row: [Node] = [], area = 0.0, big = 0.0, small = 0.0, i = 0
+        var row: [(Node, Double)] = [], area = 0.0, big = 0.0, small = 0.0, i = 0
         while i < kids.count, rem.width > 0.5, rem.height > 0.5 {
-            let a = Double(kids[i].size) * scale
+            let a = areas[i]
             if a <= 0 { break }
             let w = Double(min(rem.width, rem.height))
             if row.isEmpty || worst(area + a, max(big, a), min(small, a), w) <= worst(area, big, small, w) {
                 big = row.isEmpty ? a : max(big, a)
                 small = row.isEmpty ? a : min(small, a)
-                row.append(kids[i]); area += a; i += 1
+                row.append((kids[i], a)); area += a; i += 1
             } else {
-                flush(row, area, scale, &rem)
+                flush(row, area, &rem)
                 row.removeAll(keepingCapacity: true); area = 0
             }
         }
-        if !row.isEmpty { flush(row, area, scale, &rem) }
+        if !row.isEmpty { flush(row, area, &rem) }
+    }
+
+    // Pixel areas: cap the giant child and keep a clickable floor for the rest.
+    private func tileAreas(_ kids: [Node], in rect: CGRect) -> [Double] {
+        let area = Double(rect.width * rect.height)
+        let n = kids.count
+        let total = Double(kids.reduce(Int64(0)) { $0 + $1.size })
+        var areas = kids.map { area * Double($0.size) / total }
+        if n > 1, let i = areas.indices.max(by: { areas[$0] < areas[$1] }) {
+            let cap = area * Self.maxShare
+            if areas[i] > cap {
+                let extra = areas[i] - cap
+                areas[i] = cap
+                let others = areas.indices.filter { $0 != i }
+                let otherSum = others.reduce(0.0) { $0 + areas[$1] }
+                if otherSum > 0 {
+                    for j in others { areas[j] += extra * areas[j] / otherSum }
+                } else {
+                    let add = extra / Double(others.count)
+                    for j in others { areas[j] += add }
+                }
+            }
+        }
+        let minA = min(Double(Self.minSide * Self.minSide), area / Double(max(n, 1)) * 0.5)
+        var need = 0.0
+        for i in areas.indices where areas[i] < minA { need += minA - areas[i]; areas[i] = minA }
+        let pool = areas.indices.filter { areas[$0] > minA }
+        let avail = pool.reduce(0.0) { $0 + areas[$1] - minA }
+        if need > 0, avail > 0 {
+            let take = min(need, avail)
+            for i in pool { areas[i] -= take * (areas[i] - minA) / avail }
+        }
+        return areas
     }
 
     private func worst(_ s: Double, _ mx: Double, _ mn: Double, _ w: Double) -> Double {
         max(w * w * mx / (s * s), s * s / (w * w * mn))
     }
 
-    private func flush(_ row: [Node], _ area: Double, _ scale: Double, _ rem: inout CGRect) {
+    private func flush(_ row: [(Node, Double)], _ area: Double, _ rem: inout CGRect) {
         if rem.width >= rem.height {
             let w = CGFloat(area / Double(rem.height))
             var y = rem.minY
-            for k in row {
-                let h = CGFloat(Double(k.size) * scale) / w
-                place(k, CGRect(x: rem.minX, y: y, width: w, height: h))
+            for (k, a) in row {
+                let h = CGFloat(a) / w
+                tile(k, CGRect(x: rem.minX, y: y, width: w, height: h))
                 y += h
             }
             rem.origin.x += w; rem.size.width -= w
         } else {
             let h = CGFloat(area / Double(rem.width))
             var x = rem.minX
-            for k in row {
-                let w = CGFloat(Double(k.size) * scale) / h
-                place(k, CGRect(x: x, y: rem.minY, width: w, height: h))
+            for (k, a) in row {
+                let w = CGFloat(a) / h
+                tile(k, CGRect(x: x, y: rem.minY, width: w, height: h))
                 x += w
             }
             rem.origin.y += h; rem.size.height -= h
         }
+    }
+
+    private func tile(_ node: Node, _ rect: CGRect) {
+        if rect.width < 0.5 || rect.height < 0.5 { return }
+        items.append((rect, node))
     }
 
     override func draw(_ dirty: NSRect) {
@@ -169,15 +221,63 @@ final class TreemapView: NSView {
         ctx.setLineWidth(1)
         ctx.setStrokeColor(CGColor(gray: 0, alpha: 0.5))
         for (r, n) in items where r.intersects(dirty) {
-            ctx.setFillColor(n.isDir ? Self.dirColor : color(n.tag))
+            ctx.setFillColor(color(n.tag))
             ctx.fill(r)
             if r.width > 4, r.height > 4 { ctx.stroke(r.insetBy(dx: 0.5, dy: 0.5)) }
+            caption(n, r)
         }
         if let h = hovered, h < items.count {
             ctx.setLineWidth(2)
             ctx.setStrokeColor(CGColor(gray: 1, alpha: 1))
             ctx.stroke(items[h].0.insetBy(dx: 1, dy: 1))
         }
+    }
+
+    // Name centered, size bottom-right. Skip either (or both) when the tile is too small.
+    private func caption(_ n: Node, _ r: CGRect) {
+        let pad: CGFloat = 4
+        guard r.width >= 28, r.height >= 14, let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let light = !isLightFill(n)
+        let fg: NSColor = light ? .white : NSColor(white: 0.1, alpha: 1)
+        let halo = light ? Self.darkHalo : Self.lightHalo
+        let nameFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let sizeFont = NSFont.systemFont(ofSize: 9)
+        let nameAttrs: [NSAttributedString.Key: Any] = [
+            .font: nameFont, .foregroundColor: fg, .paragraphStyle: Self.namePara, .shadow: halo
+        ]
+        let sizeAttrs: [NSAttributedString.Key: Any] = [
+            .font: sizeFont, .foregroundColor: fg.withAlphaComponent(0.9), .shadow: halo
+        ]
+        let nameH = ceil(("Ag" as NSString).size(withAttributes: nameAttrs).height)
+        let sizeStr = bytes.string(fromByteCount: n.size) as NSString
+        let sizeSz = sizeStr.size(withAttributes: sizeAttrs)
+        var showSize = sizeSz.width + pad * 2 <= r.width && sizeSz.height + pad * 2 <= r.height
+        var nameArea = CGRect(x: r.minX + pad, y: r.minY + pad, width: r.width - pad * 2, height: r.height - pad * 2)
+        let fullNameW = (n.name as NSString).size(withAttributes: nameAttrs).width
+        // Truncate only when enough width remains to keep a useful fragment; short names can use a smaller tile.
+        func nameFits(_ area: CGRect) -> Bool {
+            area.height >= nameH && (fullNameW <= area.width || area.width >= 64)
+        }
+        if showSize {
+            let reserved = sizeSz.height + pad
+            var shrunk = nameArea
+            shrunk.size.height -= reserved
+            if nameFits(shrunk) { nameArea = shrunk } else if nameFits(nameArea) { showSize = false }
+        }
+        ctx.saveGState()
+        ctx.clip(to: r.insetBy(dx: 1, dy: 1))
+        if nameFits(nameArea) {
+            (n.name as NSString).draw(in: CGRect(x: nameArea.minX, y: nameArea.midY - nameH / 2, width: nameArea.width, height: nameH), withAttributes: nameAttrs)
+        }
+        if showSize {
+            sizeStr.draw(at: CGPoint(x: r.maxX - pad - sizeSz.width, y: r.maxY - pad - sizeSz.height), withAttributes: sizeAttrs)
+        }
+        ctx.restoreGState()
+    }
+
+    private func isLightFill(_ n: Node) -> Bool {
+        guard let c = color(n.tag).converted(to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil)?.components, c.count >= 3 else { return true }
+        return (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) > 0.55
     }
 
     private func color(_ tag: UInt32) -> CGColor {
@@ -206,9 +306,7 @@ final class TreemapView: NSView {
         guard let i = hit(e), let r = root else { return }
         let n = items[i].1
         if e.modifierFlags.contains(.command) { NSWorkspace.shared.activateFileViewerSelecting([n.url]); return }
-        var t = n
-        while let p = t.parent, p !== r { t = p }   // child of current root containing the click
-        if t !== r, t.isDir { zoom(t) }
+        if n !== r, n.isDir { zoom(n) }
     }
     override func menu(for e: NSEvent) -> NSMenu? {
         let i = hit(e)

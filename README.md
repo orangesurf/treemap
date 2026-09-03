@@ -22,7 +22,7 @@ Requires the Xcode command line tools (`xcode-select --install`).
 | Input | Effect |
 |---|---|
 | Hover | path and size in the status bar |
-| Click | zoom into the subfolder containing that file |
+| Click | zoom into that folder |
 | Click breadcrumb | jump to that folder (rescans if it is above the opened folder) |
 | ⌘-click breadcrumb | reveal that folder in Finder |
 | Esc | zoom out one level |
