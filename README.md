@@ -23,6 +23,8 @@ Requires the Xcode command line tools (`xcode-select --install`).
 |---|---|
 | Hover | path and size in the status bar |
 | Click | zoom into the subfolder containing that file |
+| Click breadcrumb | jump to that folder (rescans if it is above the opened folder) |
+| ⌘-click breadcrumb | reveal that folder in Finder |
 | Esc | zoom out one level |
 | Right-click | Reveal in Finder, Move to Trash, Zoom Out |
 | Cmd-click | reveal in Finder |

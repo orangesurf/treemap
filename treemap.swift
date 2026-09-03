@@ -18,6 +18,7 @@
 // Build: swiftc -O main.swift -o treemap
 // Run:   ./treemap [folder]        (no arg → folder picker)
 // Hover = path/size · click = zoom into that subfolder · Esc = zoom out
+// Click breadcrumbs = jump to that folder (rescans if above the opened folder) · ⌘-click = reveal in Finder
 // Right-click = menu (Reveal in Finder / Move to Trash / Zoom Out) · ⌘O open · ⌘R rescan · ⌘Q quit
 import AppKit
 
@@ -249,13 +250,100 @@ final class TreemapView: NSView {
     override func keyDown(with e: NSEvent) {
         if e.keyCode == 53 { zoomOut() } else { super.keyDown(with: e) }
     }
+    func zoomTo(_ n: Node) { zoom(n) }
     private func zoom(_ n: Node) { root = n; onZoom?(n) }
+}
+
+// Finder-style path bar. Click a parent to zoom back, or to rescan if it's above the opened folder.
+final class CrumbsView: NSView {
+    var onPick: ((Node?, URL) -> Void)?
+    private struct Item { let title: String; let node: Node?; let url: URL }
+    private let stack = NSStackView()
+    private var items: [Item] = []
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = CGColor(gray: 0.13, alpha: 1)
+        appearance = NSAppearance(named: .darkAqua)
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 2
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var acceptsFirstResponder: Bool { false }
+
+    func show(_ n: Node?) {
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        items.removeAll()
+        guard let n else { return }
+        var byPath: [String: Node] = [:]
+        var x: Node? = n
+        while let c = x {
+            byPath[URL(fileURLWithPath: c.path).standardizedFileURL.path] = c
+            x = c.parent
+        }
+        let url = URL(fileURLWithPath: n.path).standardizedFileURL
+        let vol = (try? url.resourceValues(forKeys: [.volumeNameKey]))?.volumeName ?? "Macintosh HD"
+        items.append(Item(title: vol, node: byPath["/"], url: URL(fileURLWithPath: "/")))
+        var prefix = URL(fileURLWithPath: "/")
+        for part in url.pathComponents where part != "/" {
+            prefix = prefix.appendingPathComponent(part)
+            let p = prefix.standardizedFileURL
+            items.append(Item(title: part, node: byPath[p.path], url: p))
+        }
+        for (i, item) in items.enumerated() {
+            if i > 0 {
+                let chev = NSTextField(labelWithString: "›")
+                chev.font = .systemFont(ofSize: 11, weight: .semibold)
+                chev.textColor = NSColor.white.withAlphaComponent(0.35)
+                chev.isSelectable = false
+                chev.setContentHuggingPriority(.required, for: .horizontal)
+                stack.addArrangedSubview(chev)
+            }
+            let last = i == items.count - 1
+            let btn = NSButton(title: item.title, target: self, action: #selector(pick(_:)))
+            btn.tag = i
+            btn.bezelStyle = .recessed
+            btn.setButtonType(.momentaryLight)
+            btn.controlSize = .small
+            btn.focusRingType = .none
+            btn.font = .systemFont(ofSize: 12, weight: last ? .semibold : .medium)
+            btn.toolTip = item.url.path
+            btn.setContentHuggingPriority(last ? .defaultHigh : .defaultLow, for: .horizontal)
+            btn.setContentCompressionResistancePriority(last ? .required : .defaultLow, for: .horizontal)
+            stack.addArrangedSubview(btn)
+        }
+    }
+
+    @objc private func pick(_ sender: NSButton) {
+        let i = sender.tag
+        guard i >= 0, i < items.count else { return }
+        let item = items[i]
+        if NSApp.currentEvent?.modifierFlags.contains(.command) == true {
+            NSWorkspace.shared.activateFileViewerSelecting([item.url])
+        } else {
+            onPick?(item.node, item.url)
+            return
+        }
+        if let w = window {
+            for v in w.contentView?.subviews ?? [] where v is TreemapView { _ = w.makeFirstResponder(v); break }
+        }
+    }
 }
 
 final class App: NSObject, NSApplicationDelegate {
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1200, height: 750),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
     let view = TreemapView()
+    let crumbs = CrumbsView()
     let status = NSTextField(labelWithString: " ")
     let bytes = ByteCountFormatter()
     var tree: Node?
@@ -265,12 +353,16 @@ final class App: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         menus()
         let content = NSView()
-        for v in [view, status] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(v) }
+        for v in [view, status, crumbs] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(v) }
         status.lineBreakMode = .byTruncatingMiddle
         status.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
-            view.topAnchor.constraint(equalTo: content.topAnchor),
+            crumbs.topAnchor.constraint(equalTo: content.topAnchor),
+            crumbs.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            crumbs.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            crumbs.heightAnchor.constraint(equalToConstant: 32),
+            view.topAnchor.constraint(equalTo: crumbs.bottomAnchor),
             view.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             view.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             view.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -4),
@@ -288,6 +380,16 @@ final class App: NSObject, NSApplicationDelegate {
             self.status.stringValue = n.map { "\($0.path) — \(self.bytes.string(fromByteCount: $0.size))" + ($0.isDir ? " — \(self.num($0.count)) files" : "") } ?? " "
         }
         view.onZoom = { [unowned self] in self.title($0) }
+        crumbs.onPick = { [unowned self] n, url in
+            if let n {
+                self.view.zoomTo(n)
+            } else if let s = self.scanURL, s.standardizedFileURL.path == url.standardizedFileURL.path, let t = self.tree {
+                self.view.zoomTo(t)
+            } else {
+                self.scan(url)
+            }
+            _ = self.window.makeFirstResponder(self.view)
+        }
         NSApp.activate(ignoringOtherApps: true)
         if CommandLine.arguments.count > 1 { scan(URL(fileURLWithPath: CommandLine.arguments[1])) } else { openFolder(nil) }
     }
@@ -317,6 +419,7 @@ final class App: NSObject, NSApplicationDelegate {
         scanURL = url
         view.root = nil
         tree = nil
+        crumbs.show(nil)
         window.title = url.path
         status.stringValue = "Scanning…"
         DispatchQueue.global(qos: .userInitiated).async {
@@ -333,7 +436,10 @@ final class App: NSObject, NSApplicationDelegate {
         }
     }
 
-    func title(_ n: Node) { window.title = "\(n.path) — \(bytes.string(fromByteCount: n.size)) — \(num(n.count)) files" }
+    func title(_ n: Node) {
+        window.title = "\(n.path) — \(bytes.string(fromByteCount: n.size)) — \(num(n.count)) files"
+        crumbs.show(n)
+    }
     func num(_ n: Int) -> String { NumberFormatter.localizedString(from: NSNumber(value: n), number: .decimal) }
 }
 
