@@ -15,7 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 // main.swift — Disk treemap. AppKit only, no dependencies.
 // 
-// Build: swiftc -O main.swift -o treemap
+// Build: swiftc -O treemap.swift main.swift -o treemap
 // Run:   ./treemap [folder]        (no arg → folder picker)
 // Hover = path/size · click a folder to zoom in · Esc = zoom out
 // Click breadcrumbs = jump to that folder (rescans if above the opened folder) · ⌘-click = reveal in Finder
@@ -33,6 +33,19 @@ final class Node {
     var isDir: Bool { children != nil }
     var path: String { parent.map { ($0.path == "/" ? "/" : $0.path + "/") + name } ?? name }
     var url: URL { URL(fileURLWithPath: path) }
+
+    // Drop this node from its parent and subtract size/count up the ancestor chain.
+    func detach() {
+        guard let p = parent else { return }
+        p.children?.removeAll { $0 === self }
+        var a: Node? = p
+        while let x = a {
+            x.size -= size
+            x.count -= count
+            x.parent?.children?.sort { $0.size > $1.size }
+            a = x.parent
+        }
+    }
 }
 
 enum Scan {
@@ -84,6 +97,132 @@ enum Scan {
     }
 }
 
+enum Layout {
+    static let maxShare = 0.75          // largest child cannot eat the whole view
+    static let minSide: CGFloat = 28    // clickable / labelable floor
+
+    // Squarified treemap (Bruls et al.). One level of children; folders stay folders.
+    static func place(_ node: Node, _ rect: CGRect) -> [(CGRect, Node)] {
+        var items: [(CGRect, Node)] = []
+        place(node, rect, into: &items)
+        return items
+    }
+
+    static func place(_ node: Node, _ rect: CGRect, into items: inout [(CGRect, Node)]) {
+        if rect.width < 0.5 || rect.height < 0.5 { return }
+        guard let raw = node.children, node.size > 0, rect.width >= 3, rect.height >= 3 else { items.append((rect, node)); return }
+        let kids = raw.filter { $0.size > 0 }
+        guard !kids.isEmpty else { items.append((rect, node)); return }
+        let areas = tileAreas(kids, in: rect)
+        var rem = rect
+        var row: [(Node, Double)] = [], area = 0.0, big = 0.0, small = 0.0, i = 0
+        while i < kids.count, rem.width > 0.5, rem.height > 0.5 {
+            let a = areas[i]
+            if a <= 0 { break }
+            let w = Double(min(rem.width, rem.height))
+            if row.isEmpty || worst(area + a, max(big, a), min(small, a), w) <= worst(area, big, small, w) {
+                big = row.isEmpty ? a : max(big, a)
+                small = row.isEmpty ? a : min(small, a)
+                row.append((kids[i], a)); area += a; i += 1
+            } else {
+                flush(row, area, &rem, into: &items)
+                row.removeAll(keepingCapacity: true); area = 0
+            }
+        }
+        if !row.isEmpty { flush(row, area, &rem, into: &items) }
+    }
+
+    // Pixel areas: cap the giant child and keep a clickable floor for the rest.
+    static func tileAreas(_ kids: [Node], in rect: CGRect) -> [Double] {
+        let area = Double(rect.width * rect.height)
+        let n = kids.count
+        let total = Double(kids.reduce(Int64(0)) { $0 + $1.size })
+        var areas = kids.map { area * Double($0.size) / total }
+        if n > 1, let i = areas.indices.max(by: { areas[$0] < areas[$1] }) {
+            let cap = area * maxShare
+            if areas[i] > cap {
+                let extra = areas[i] - cap
+                areas[i] = cap
+                let others = areas.indices.filter { $0 != i }
+                let otherSum = others.reduce(0.0) { $0 + areas[$1] }
+                if otherSum > 0 {
+                    for j in others { areas[j] += extra * areas[j] / otherSum }
+                } else {
+                    let add = extra / Double(others.count)
+                    for j in others { areas[j] += add }
+                }
+            }
+        }
+        let minA = min(Double(minSide * minSide), area / Double(max(n, 1)) * 0.5)
+        var need = 0.0
+        for i in areas.indices where areas[i] < minA { need += minA - areas[i]; areas[i] = minA }
+        let pool = areas.indices.filter { areas[$0] > minA }
+        let avail = pool.reduce(0.0) { $0 + areas[$1] - minA }
+        if need > 0, avail > 0 {
+            let take = min(need, avail)
+            for i in pool { areas[i] -= take * (areas[i] - minA) / avail }
+        }
+        return areas
+    }
+
+    static func worst(_ s: Double, _ mx: Double, _ mn: Double, _ w: Double) -> Double {
+        max(w * w * mx / (s * s), s * s / (w * w * mn))
+    }
+
+    private static func flush(_ row: [(Node, Double)], _ area: Double, _ rem: inout CGRect, into items: inout [(CGRect, Node)]) {
+        if rem.width >= rem.height {
+            let w = CGFloat(area / Double(rem.height))
+            var y = rem.minY
+            for (k, a) in row {
+                let h = CGFloat(a) / w
+                tile(k, CGRect(x: rem.minX, y: y, width: w, height: h), into: &items)
+                y += h
+            }
+            rem.origin.x += w; rem.size.width -= w
+        } else {
+            let h = CGFloat(area / Double(rem.width))
+            var x = rem.minX
+            for (k, a) in row {
+                let w = CGFloat(a) / h
+                tile(k, CGRect(x: x, y: rem.minY, width: w, height: h), into: &items)
+                x += w
+            }
+            rem.origin.y += h; rem.size.height -= h
+        }
+    }
+
+    private static func tile(_ node: Node, _ rect: CGRect, into items: inout [(CGRect, Node)]) {
+        if rect.width < 0.5 || rect.height < 0.5 { return }
+        items.append((rect, node))
+    }
+}
+
+enum Breadcrumb {
+    struct Item {
+        let title: String
+        let node: Node?
+        let url: URL
+    }
+
+    static func items(for n: Node, volumeName: String) -> [Item] {
+        var byPath: [String: Node] = [:]
+        var x: Node? = n
+        while let c = x {
+            byPath[URL(fileURLWithPath: c.path).standardizedFileURL.path] = c
+            x = c.parent
+        }
+        let url = URL(fileURLWithPath: n.path).standardizedFileURL
+        var items = [Item(title: volumeName, node: byPath["/"], url: URL(fileURLWithPath: "/"))]
+        var prefix = URL(fileURLWithPath: "/")
+        for part in url.pathComponents where part != "/" {
+            prefix = prefix.appendingPathComponent(part)
+            let p = prefix.standardizedFileURL
+            items.append(Item(title: part, node: byPath[p.path], url: p))
+        }
+        return items
+    }
+}
+
 final class TreemapView: NSView {
     var root: Node? { didSet { relayout(); needsDisplay = true } }
     var onHover: ((Node?) -> Void)?
@@ -96,8 +235,6 @@ final class TreemapView: NSView {
     private var colors: [UInt32: CGColor] = [:]
     private let bytes = ByteCountFormatter()
     private static let noExt = Scan.fnv("")
-    private static let maxShare = 0.75          // largest child cannot eat the whole view
-    private static let minSide: CGFloat = 28    // clickable / labelable floor
     private static let namePara: NSParagraphStyle = {
         let p = NSMutableParagraphStyle(); p.alignment = .center; p.lineBreakMode = .byTruncatingMiddle; return p
     }()
@@ -117,100 +254,11 @@ final class TreemapView: NSView {
         super.updateTrackingAreas()
     }
 
-    // Squarified treemap (Bruls et al.). One level of children; folders stay folders.
     private func relayout() {
         items.removeAll(keepingCapacity: true)
         hovered = nil
         laidOut = bounds.size
-        if let r = root { place(r, bounds) }
-    }
-
-    private func place(_ node: Node, _ rect: CGRect) {
-        if rect.width < 0.5 || rect.height < 0.5 { return }
-        guard let raw = node.children, node.size > 0, rect.width >= 3, rect.height >= 3 else { items.append((rect, node)); return }
-        let kids = raw.filter { $0.size > 0 }
-        guard !kids.isEmpty else { items.append((rect, node)); return }
-        let areas = tileAreas(kids, in: rect)
-        var rem = rect
-        var row: [(Node, Double)] = [], area = 0.0, big = 0.0, small = 0.0, i = 0
-        while i < kids.count, rem.width > 0.5, rem.height > 0.5 {
-            let a = areas[i]
-            if a <= 0 { break }
-            let w = Double(min(rem.width, rem.height))
-            if row.isEmpty || worst(area + a, max(big, a), min(small, a), w) <= worst(area, big, small, w) {
-                big = row.isEmpty ? a : max(big, a)
-                small = row.isEmpty ? a : min(small, a)
-                row.append((kids[i], a)); area += a; i += 1
-            } else {
-                flush(row, area, &rem)
-                row.removeAll(keepingCapacity: true); area = 0
-            }
-        }
-        if !row.isEmpty { flush(row, area, &rem) }
-    }
-
-    // Pixel areas: cap the giant child and keep a clickable floor for the rest.
-    private func tileAreas(_ kids: [Node], in rect: CGRect) -> [Double] {
-        let area = Double(rect.width * rect.height)
-        let n = kids.count
-        let total = Double(kids.reduce(Int64(0)) { $0 + $1.size })
-        var areas = kids.map { area * Double($0.size) / total }
-        if n > 1, let i = areas.indices.max(by: { areas[$0] < areas[$1] }) {
-            let cap = area * Self.maxShare
-            if areas[i] > cap {
-                let extra = areas[i] - cap
-                areas[i] = cap
-                let others = areas.indices.filter { $0 != i }
-                let otherSum = others.reduce(0.0) { $0 + areas[$1] }
-                if otherSum > 0 {
-                    for j in others { areas[j] += extra * areas[j] / otherSum }
-                } else {
-                    let add = extra / Double(others.count)
-                    for j in others { areas[j] += add }
-                }
-            }
-        }
-        let minA = min(Double(Self.minSide * Self.minSide), area / Double(max(n, 1)) * 0.5)
-        var need = 0.0
-        for i in areas.indices where areas[i] < minA { need += minA - areas[i]; areas[i] = minA }
-        let pool = areas.indices.filter { areas[$0] > minA }
-        let avail = pool.reduce(0.0) { $0 + areas[$1] - minA }
-        if need > 0, avail > 0 {
-            let take = min(need, avail)
-            for i in pool { areas[i] -= take * (areas[i] - minA) / avail }
-        }
-        return areas
-    }
-
-    private func worst(_ s: Double, _ mx: Double, _ mn: Double, _ w: Double) -> Double {
-        max(w * w * mx / (s * s), s * s / (w * w * mn))
-    }
-
-    private func flush(_ row: [(Node, Double)], _ area: Double, _ rem: inout CGRect) {
-        if rem.width >= rem.height {
-            let w = CGFloat(area / Double(rem.height))
-            var y = rem.minY
-            for (k, a) in row {
-                let h = CGFloat(a) / w
-                tile(k, CGRect(x: rem.minX, y: y, width: w, height: h))
-                y += h
-            }
-            rem.origin.x += w; rem.size.width -= w
-        } else {
-            let h = CGFloat(area / Double(rem.width))
-            var x = rem.minX
-            for (k, a) in row {
-                let w = CGFloat(a) / h
-                tile(k, CGRect(x: x, y: rem.minY, width: w, height: h))
-                x += w
-            }
-            rem.origin.y += h; rem.size.height -= h
-        }
-    }
-
-    private func tile(_ node: Node, _ rect: CGRect) {
-        if rect.width < 0.5 || rect.height < 0.5 { return }
-        items.append((rect, node))
+        if let r = root { Layout.place(r, bounds, into: &items) }
     }
 
     override func draw(_ dirty: NSRect) {
@@ -331,12 +379,10 @@ final class TreemapView: NSView {
     }
 
     @objc private func trashClicked() {
-        guard let n = menuNode, let p = n.parent else { return }
+        guard let n = menuNode, n.parent != nil else { return }
         do { try FileManager.default.trashItem(at: n.url, resultingItemURL: nil) }
         catch { NSAlert(error: error).runModal(); return }
-        p.children?.removeAll { $0 === n }
-        var a: Node? = p                                    // fix sizes/counts up the chain, keep siblings sorted
-        while let x = a { x.size -= n.size; x.count -= n.count; x.parent?.children?.sort { $0.size > $1.size }; a = x.parent }
+        n.detach()
         menuNode = nil
         relayout()
         needsDisplay = true
@@ -355,9 +401,8 @@ final class TreemapView: NSView {
 // Finder-style path bar. Click a parent to zoom back, or to rescan if it's above the opened folder.
 final class CrumbsView: NSView {
     var onPick: ((Node?, URL) -> Void)?
-    private struct Item { let title: String; let node: Node?; let url: URL }
     private let stack = NSStackView()
-    private var items: [Item] = []
+    private var items: [Breadcrumb.Item] = []
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -382,21 +427,9 @@ final class CrumbsView: NSView {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         items.removeAll()
         guard let n else { return }
-        var byPath: [String: Node] = [:]
-        var x: Node? = n
-        while let c = x {
-            byPath[URL(fileURLWithPath: c.path).standardizedFileURL.path] = c
-            x = c.parent
-        }
         let url = URL(fileURLWithPath: n.path).standardizedFileURL
         let vol = (try? url.resourceValues(forKeys: [.volumeNameKey]))?.volumeName ?? "Macintosh HD"
-        items.append(Item(title: vol, node: byPath["/"], url: URL(fileURLWithPath: "/")))
-        var prefix = URL(fileURLWithPath: "/")
-        for part in url.pathComponents where part != "/" {
-            prefix = prefix.appendingPathComponent(part)
-            let p = prefix.standardizedFileURL
-            items.append(Item(title: part, node: byPath[p.path], url: p))
-        }
+        items = Breadcrumb.items(for: n, volumeName: vol)
         for (i, item) in items.enumerated() {
             if i > 0 {
                 let chev = NSTextField(labelWithString: "›")
@@ -540,9 +573,3 @@ final class App: NSObject, NSApplicationDelegate {
     }
     func num(_ n: Int) -> String { NumberFormatter.localizedString(from: NSNumber(value: n), number: .decimal) }
 }
-
-let app = NSApplication.shared
-let delegate = App()
-app.delegate = delegate
-app.setActivationPolicy(.regular)
-app.run()
