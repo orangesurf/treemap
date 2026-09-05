@@ -19,7 +19,8 @@
 // Run:   ./treemap [folder]        (no arg → folder picker)
 // Hover = path/size · click a folder to zoom in · Esc = zoom out
 // Click breadcrumbs = jump to that folder (rescans if above the opened folder) · ⌘-click = reveal in Finder
-// Right-click = menu (Reveal in Finder / Move to Trash / Zoom Out) · ⌘O open · ⌘R rescan · ⌘Q quit
+// List button (right of breadcrumbs) = files and folders in the current folder · click a folder to zoom · ⌘-click = reveal
+// Right-click a tile or list item = menu (Reveal in Finder / Move to Trash / Zoom Out) · ⌘O open · ⌘R rescan · ⌘Q quit
 import AppKit
 
 final class Node {
@@ -223,6 +224,27 @@ enum Breadcrumb {
     }
 }
 
+enum FolderList {
+    static func entries(under n: Node?) -> [Node] { n?.children ?? [] }
+}
+
+enum NodeMenu {
+    static func make(node: Node?, canZoomOut: Bool, target: AnyObject, reveal: Selector, trash: Selector, zoomOut: Selector) -> NSMenu {
+        let m = NSMenu()
+        m.autoenablesItems = false
+        func add(_ title: String, _ sel: Selector, _ enabled: Bool) {
+            let it = m.addItem(withTitle: title, action: sel, keyEquivalent: "")
+            it.target = target
+            it.isEnabled = enabled
+        }
+        add("Reveal in Finder", reveal, node != nil)
+        add("Move to Trash", trash, node?.parent != nil)
+        m.addItem(.separator())
+        add("Zoom Out", zoomOut, canZoomOut)
+        return m
+    }
+}
+
 final class TreemapView: NSView {
     var root: Node? { didSet { relayout(); needsDisplay = true } }
     var onHover: ((Node?) -> Void)?
@@ -360,26 +382,18 @@ final class TreemapView: NSView {
         let i = hit(e)
         menuNode = i.map { items[$0].1 }
         hover(i)
-        let m = NSMenu()
-        m.autoenablesItems = false
-        func add(_ title: String, _ sel: Selector, _ enabled: Bool) {
-            let it = m.addItem(withTitle: title, action: sel, keyEquivalent: "")
-            it.target = self
-            it.isEnabled = enabled
-        }
-        add("Reveal in Finder", #selector(revealClicked), menuNode != nil)
-        add("Move to Trash", #selector(trashClicked), menuNode?.parent != nil)
-        m.addItem(.separator())
-        add("Zoom Out", #selector(zoomOut), root?.parent != nil)
-        return m
+        return NodeMenu.make(node: menuNode, canZoomOut: root?.parent != nil, target: self,
+                             reveal: #selector(revealClicked), trash: #selector(trashClicked), zoomOut: #selector(zoomOut))
     }
 
     @objc private func revealClicked() {
         if let n = menuNode { NSWorkspace.shared.activateFileViewerSelecting([n.url]) }
     }
 
-    @objc private func trashClicked() {
-        guard let n = menuNode, n.parent != nil else { return }
+    @objc private func trashClicked() { if let n = menuNode { trash(n) } }
+
+    func trash(_ n: Node) {
+        guard n.parent != nil else { return }
         do { try FileManager.default.trashItem(at: n.url, resultingItemURL: nil) }
         catch { NSAlert(error: error).runModal(); return }
         n.detach()
@@ -389,19 +403,22 @@ final class TreemapView: NSView {
         if let r = root { onZoom?(r) }
     }
 
-    @objc private func zoomOut() { if let p = root?.parent { zoom(p) } }
+    @objc func zoomOut() { if let p = root?.parent { zoom(p) } }
 
     override func keyDown(with e: NSEvent) {
         if e.keyCode == 53 { zoomOut() } else { super.keyDown(with: e) }
     }
     func zoomTo(_ n: Node) { zoom(n) }
+    func highlight(_ n: Node?) { hover(n.flatMap { t in items.firstIndex { $0.1 === t } }) }
     private func zoom(_ n: Node) { root = n; onZoom?(n) }
 }
 
 // Finder-style path bar. Click a parent to zoom back, or to rescan if it's above the opened folder.
 final class CrumbsView: NSView {
     var onPick: ((Node?, URL) -> Void)?
+    var onToggleList: ((Bool) -> Void)?
     private let stack = NSStackView()
+    private let toggle = NSButton()
     private var items: [Breadcrumb.Item] = []
 
     override init(frame frameRect: NSRect) {
@@ -414,14 +431,48 @@ final class CrumbsView: NSView {
         stack.spacing = 2
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
+        toggle.bezelStyle = .recessed
+        toggle.setButtonType(.pushOnPushOff)
+        toggle.controlSize = .small
+        toggle.focusRingType = .none
+        toggle.image = NSImage(systemSymbolName: "sidebar.right", accessibilityDescription: "Files and folders")
+        toggle.imagePosition = toggle.image == nil ? .noImage : .imageOnly
+        if toggle.image == nil { toggle.title = "List" }
+        toggle.toolTip = "Show files and folders"
+        toggle.setAccessibilityLabel("Files and folders")
+        toggle.target = self
+        toggle.action = #selector(toggleList)
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+        toggle.setContentCompressionResistancePriority(.required, for: .horizontal)
+        toggle.translatesAutoresizingMaskIntoConstraints = false
+        toggle.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        addSubview(toggle)
+        let rule = NSView()
+        rule.wantsLayer = true
+        rule.layer?.backgroundColor = CGColor(gray: 1, alpha: 0.12)
+        rule.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(rule)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: rule.leadingAnchor, constant: -8),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            rule.trailingAnchor.constraint(equalTo: toggle.leadingAnchor, constant: -6),
+            rule.centerYAnchor.constraint(equalTo: centerYAnchor),
+            rule.widthAnchor.constraint(equalToConstant: 1),
+            rule.heightAnchor.constraint(equalToConstant: 16),
+            toggle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            toggle.centerYAnchor.constraint(equalTo: centerYAnchor),
+            toggle.widthAnchor.constraint(greaterThanOrEqualToConstant: 28),
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
     override var acceptsFirstResponder: Bool { false }
+
+    @objc private func toggleList(_ sender: NSButton) {
+        let open = sender.state == .on
+        sender.toolTip = open ? "Hide files and folders" : "Show files and folders"
+        onToggleList?(open)
+    }
 
     func show(_ n: Node?) {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
@@ -470,24 +521,239 @@ final class CrumbsView: NSView {
     }
 }
 
+// Side panel of children for the current zoom. Use when large files shrink the other tiles.
+final class FolderListView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    var onPick: ((Node) -> Void)?
+    var onHover: ((Node?) -> Void)?
+    var onTrash: ((Node) -> Void)?
+    var onZoomOut: (() -> Void)?
+
+    private final class Table: NSTableView {
+        override var acceptsFirstResponder: Bool { false }
+        override func menu(for event: NSEvent) -> NSMenu? {
+            (delegate as? FolderListView)?.menu(for: event)
+        }
+    }
+
+    private let table = Table()
+    private let scroll = NSScrollView()
+    private let empty = NSTextField(labelWithString: "Empty")
+    private let bytes = ByteCountFormatter()
+    private var entries: [Node] = []
+    private var hovered: Node?
+    private var current: Node?
+    private var menuNode: Node?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        clipsToBounds = true
+        layer?.backgroundColor = CGColor(gray: 0.13, alpha: 1)
+        appearance = NSAppearance(named: .darkAqua)
+
+        let nameCol = NSTableColumn(identifier: .init("name"))
+        let sizeCol = NSTableColumn(identifier: .init("size"))
+        sizeCol.width = 76
+        sizeCol.minWidth = 56
+        sizeCol.maxWidth = 96
+        table.addTableColumn(nameCol)
+        table.addTableColumn(sizeCol)
+        table.headerView = nil
+        table.dataSource = self
+        table.delegate = self
+        table.rowHeight = 22
+        table.backgroundColor = NSColor(white: 0.13, alpha: 1)
+        table.focusRingType = .none
+        table.allowsMultipleSelection = false
+        table.style = .plain
+        table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        table.intercellSpacing = NSSize(width: 8, height: 1)
+        table.target = self
+        table.action = #selector(clicked)
+        table.addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil))
+
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        empty.font = .systemFont(ofSize: 12)
+        empty.textColor = NSColor.white.withAlphaComponent(0.35)
+        empty.alignment = .center
+        empty.translatesAutoresizingMaskIntoConstraints = false
+
+        let rule = NSView()
+        rule.wantsLayer = true
+        rule.layer?.backgroundColor = CGColor(gray: 0, alpha: 0.45)
+        rule.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(scroll)
+        addSubview(empty)
+        addSubview(rule)
+        NSLayoutConstraint.activate([
+            rule.leadingAnchor.constraint(equalTo: leadingAnchor),
+            rule.topAnchor.constraint(equalTo: topAnchor),
+            rule.bottomAnchor.constraint(equalTo: bottomAnchor),
+            rule.widthAnchor.constraint(equalToConstant: 1),
+            scroll.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            scroll.leadingAnchor.constraint(equalTo: rule.trailingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            empty.centerXAnchor.constraint(equalTo: centerXAnchor, constant: 4),
+            empty.centerYAnchor.constraint(equalTo: centerYAnchor),
+            empty.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 12),
+        ])
+        empty.isHidden = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var acceptsFirstResponder: Bool { false }
+
+    func show(_ n: Node?) {
+        current = n
+        menuNode = nil
+        entries = FolderList.entries(under: n)
+        empty.isHidden = !entries.isEmpty
+        scroll.isHidden = entries.isEmpty
+        table.reloadData()
+        hover(nil)
+    }
+
+    override func menu(for e: NSEvent) -> NSMenu? {
+        let p = table.convert(e.locationInWindow, from: nil)
+        let row = table.row(at: p)
+        if row >= 0, row < entries.count {
+            menuNode = entries[row]
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            hover(menuNode)
+        } else {
+            menuNode = nil
+            table.deselectAll(nil)
+        }
+        return NodeMenu.make(node: menuNode, canZoomOut: current?.parent != nil, target: self,
+                             reveal: #selector(revealClicked), trash: #selector(trashClicked), zoomOut: #selector(zoomOutClicked))
+    }
+
+    @objc private func revealClicked() {
+        if let n = menuNode { NSWorkspace.shared.activateFileViewerSelecting([n.url]) }
+    }
+    @objc private func trashClicked() { if let n = menuNode { onTrash?(n) } }
+    @objc private func zoomOutClicked() { onZoomOut?() }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { entries.count }
+
+    func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
+        let n = entries[row]
+        return tableColumn?.identifier.rawValue == "size" ? bytes.string(fromByteCount: n.size) : n.name
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let n = entries[row]
+        let id = tableColumn?.identifier ?? .init("name")
+        let size = id.rawValue == "size"
+        let cell = (tableView.makeView(withIdentifier: id, owner: self) as? NSTableCellView) ?? Self.makeCell(id, icon: !size)
+        let field = cell.textField
+        if size {
+            field?.alignment = .right
+            field?.font = .systemFont(ofSize: 11)
+            field?.textColor = NSColor.white.withAlphaComponent(0.55)
+            field?.stringValue = bytes.string(fromByteCount: n.size)
+            field?.toolTip = nil
+        } else {
+            field?.alignment = .left
+            field?.font = .systemFont(ofSize: 12, weight: n.isDir ? .medium : .regular)
+            field?.textColor = n.isDir ? .white : NSColor.white.withAlphaComponent(0.85)
+            field?.stringValue = n.name
+            field?.toolTip = n.path
+            cell.imageView?.image = NSImage(systemSymbolName: n.isDir ? "folder" : "doc", accessibilityDescription: nil)
+            cell.imageView?.contentTintColor = NSColor.white.withAlphaComponent(n.isDir ? 0.7 : 0.4)
+        }
+        return cell
+    }
+
+    private static func makeCell(_ id: NSUserInterfaceItemIdentifier, icon: Bool) -> NSTableCellView {
+        let c = NSTableCellView()
+        c.identifier = id
+        let f = NSTextField(labelWithString: "")
+        f.drawsBackground = false
+        f.isBordered = false
+        f.lineBreakMode = .byTruncatingMiddle
+        f.translatesAutoresizingMaskIntoConstraints = false
+        c.addSubview(f)
+        c.textField = f
+        if icon {
+            let img = NSImageView()
+            img.imageScaling = .scaleProportionallyDown
+            img.translatesAutoresizingMaskIntoConstraints = false
+            c.addSubview(img)
+            c.imageView = img
+            NSLayoutConstraint.activate([
+                img.leadingAnchor.constraint(equalTo: c.leadingAnchor),
+                img.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+                img.widthAnchor.constraint(equalToConstant: 13),
+                img.heightAnchor.constraint(equalToConstant: 13),
+                f.leadingAnchor.constraint(equalTo: img.trailingAnchor, constant: 4),
+                f.trailingAnchor.constraint(equalTo: c.trailingAnchor),
+                f.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+            ])
+        } else {
+            NSLayoutConstraint.activate([
+                f.leadingAnchor.constraint(equalTo: c.leadingAnchor),
+                f.trailingAnchor.constraint(equalTo: c.trailingAnchor),
+                f.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+            ])
+        }
+        return c
+    }
+
+    override func mouseMoved(with e: NSEvent) {
+        let p = table.convert(e.locationInWindow, from: nil)
+        let row = table.row(at: p)
+        hover(row >= 0 && row < entries.count ? entries[row] : nil)
+    }
+    override func mouseExited(with e: NSEvent) { hover(nil) }
+
+    private func hover(_ n: Node?) {
+        guard n !== hovered else { return }
+        hovered = n
+        onHover?(n)
+    }
+
+    @objc private func clicked() {
+        let row = table.clickedRow
+        guard row >= 0, row < entries.count else { return }
+        let n = entries[row]
+        if NSApp.currentEvent?.modifierFlags.contains(.command) == true {
+            NSWorkspace.shared.activateFileViewerSelecting([n.url])
+            return
+        }
+        if n.isDir { onPick?(n) }
+    }
+}
+
 final class App: NSObject, NSApplicationDelegate {
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1200, height: 750),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
     let view = TreemapView()
     let crumbs = CrumbsView()
+    let list = FolderListView()
     let status = NSTextField(labelWithString: " ")
     let bytes = ByteCountFormatter()
     var tree: Node?
     var scanURL: URL?
     var gen = 0
+    var listWidth: NSLayoutConstraint!
 
     func applicationDidFinishLaunching(_ note: Notification) {
         menus()
         let content = NSView()
-        for v in [view, status, crumbs] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(v) }
+        for v in [view, status, crumbs, list] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(v) }
         status.lineBreakMode = .byTruncatingMiddle
         status.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        list.isHidden = true
+        listWidth = list.widthAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             crumbs.topAnchor.constraint(equalTo: content.topAnchor),
             crumbs.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -495,8 +761,12 @@ final class App: NSObject, NSApplicationDelegate {
             crumbs.heightAnchor.constraint(equalToConstant: 32),
             view.topAnchor.constraint(equalTo: crumbs.bottomAnchor),
             view.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            view.trailingAnchor.constraint(equalTo: list.leadingAnchor),
             view.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -4),
+            list.topAnchor.constraint(equalTo: crumbs.bottomAnchor),
+            list.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            list.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -4),
+            listWidth,
             status.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 8),
             status.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -8),
             status.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -4),
@@ -507,9 +777,7 @@ final class App: NSObject, NSApplicationDelegate {
         window.center()
         window.makeKeyAndOrderFront(nil)
         _ = window.makeFirstResponder(view)
-        view.onHover = { [unowned self] n in
-            self.status.stringValue = n.map { "\($0.path) — \(self.bytes.string(fromByteCount: $0.size))" + ($0.isDir ? " — \(self.num($0.count)) files" : "") } ?? " "
-        }
+        view.onHover = { [unowned self] in self.describe($0) }
         view.onZoom = { [unowned self] in self.title($0) }
         crumbs.onPick = { [unowned self] n, url in
             if let n {
@@ -519,6 +787,28 @@ final class App: NSObject, NSApplicationDelegate {
             } else {
                 self.scan(url)
             }
+            _ = self.window.makeFirstResponder(self.view)
+        }
+        crumbs.onToggleList = { [unowned self] open in
+            self.list.isHidden = !open
+            self.listWidth.constant = open ? 260 : 0
+            self.window.contentView?.layoutSubtreeIfNeeded()
+            self.view.needsDisplay = true
+        }
+        list.onPick = { [unowned self] n in
+            self.view.zoomTo(n)
+            _ = self.window.makeFirstResponder(self.view)
+        }
+        list.onHover = { [unowned self] n in
+            self.view.highlight(n)
+            self.describe(n)
+        }
+        list.onTrash = { [unowned self] n in
+            self.view.trash(n)
+            _ = self.window.makeFirstResponder(self.view)
+        }
+        list.onZoomOut = { [unowned self] in
+            self.view.zoomOut()
             _ = self.window.makeFirstResponder(self.view)
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -551,6 +841,7 @@ final class App: NSObject, NSApplicationDelegate {
         view.root = nil
         tree = nil
         crumbs.show(nil)
+        list.show(nil)
         window.title = url.path
         status.stringValue = "Scanning…"
         DispatchQueue.global(qos: .userInitiated).async {
@@ -570,6 +861,10 @@ final class App: NSObject, NSApplicationDelegate {
     func title(_ n: Node) {
         window.title = "\(n.path) — \(bytes.string(fromByteCount: n.size)) — \(num(n.count)) files"
         crumbs.show(n)
+        list.show(n)
+    }
+    func describe(_ n: Node?) {
+        status.stringValue = n.map { "\($0.path) — \(bytes.string(fromByteCount: $0.size))" + ($0.isDir ? " — \(num($0.count)) files" : "") } ?? " "
     }
     func num(_ n: Int) -> String { NumberFormatter.localizedString(from: NSNumber(value: n), number: .decimal) }
 }
