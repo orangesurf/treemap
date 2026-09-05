@@ -1,9 +1,9 @@
 # treemap
 
-A disk usage map for macOS in one Swift file
+A disk usage map for macOS
 
 ```sh
-swiftc -O treemap.swift -o treemap && ./treemap
+swiftc -O treemap.swift main.swift -o treemap && ./treemap
 ```
 
 <img width="600" alt="screenshot of treemap app" src="https://github.com/user-attachments/assets/79ab99b5-8942-4456-ae18-4f15a0b07fc3" />
@@ -11,11 +11,17 @@ swiftc -O treemap.swift -o treemap && ./treemap
 If using regularly build and then run (optional scan directory passed via arg)
 
 ```sh
-swiftc -O main.swift -o treemap 
+swiftc -O treemap.swift main.swift -o treemap
 ./treemap ~/Downloads
 ```
 
-Requires the Xcode command line tools (`xcode-select --install`).
+Clean and rebuild:
+
+```sh
+make clean && make && ./treemap
+```
+
+Requires the Xcode command line tools (`xcode-select --install`). Run tests with `swift test`.
 
 ## Controls
 
@@ -25,8 +31,11 @@ Requires the Xcode command line tools (`xcode-select --install`).
 | Click | zoom into that folder |
 | Click breadcrumb | jump to that folder (rescans if it is above the opened folder) |
 | ⌘-click breadcrumb | reveal that folder in Finder |
+| List button | show or hide files and folders in the current directory |
+| Click a listed folder | zoom into that folder |
+| ⌘-click a listed item | reveal that item in Finder |
 | Esc | zoom out one level |
-| Right-click | Reveal in Finder, Move to Trash, Zoom Out |
+| Right-click | Reveal in Finder, Move to Trash, Zoom Out (map or list) |
 | Cmd-click | reveal in Finder |
 | Cmd-O / Cmd-R / Cmd-Q | open another folder / rescan / quit |
 
